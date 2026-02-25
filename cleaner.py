@@ -1,9 +1,3 @@
-"""
-cleaner.py
-----------
-Takes raw Markdown text and strips noise that would hurt LLM training quality.
-"""
-
 import re
 import logging
 

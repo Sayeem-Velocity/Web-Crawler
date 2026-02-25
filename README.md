@@ -1,9 +1,9 @@
-# Python Blog Scraper -- LLM Data Pipeline
+# Web Scraping Pipeline for LLM Data
 
-A production-ready web scraping system that extracts blog posts from
-**https://blog.python.org/**, converts them to clean Markdown, chunks
-them into token-sized pieces, attaches metadata, and exports everything
-as a JSONL file ready for LLM fine-tuning or embedding.
+A production-ready web scraping system that crawls **any website**, converts
+pages to clean Markdown, chunks content into token-sized pieces, attaches
+metadata, and exports everything as a JSONL file ready for LLM fine-tuning
+or embedding / RAG.
 
 ---
 
@@ -15,48 +15,47 @@ as a JSONL file ready for LLM fine-tuning or embedding.
 4. [File Structure](#file-structure)
 5. [Setup](#setup)
 6. [Usage](#usage)
-7. [Configuration](#configuration)
-8. [Output Format](#output-format)
-9. [Extending the Pipeline](#extending-the-pipeline)
+7. [Changing the Target Site](#changing-the-target-site)
+8. [Configuration Reference](#configuration-reference)
+9. [Output Format](#output-format)
+10. [Extending the Pipeline](#extending-the-pipeline)
 
 ---
 
 ## Project Overview
 
-This project automates the collection and preparation of text data from
-the official Python blog.  The output is a single JSONL file where each
-line is a self-contained JSON object with a chunk of text and rich
-metadata.  This format is directly consumable by:
+This pipeline automates the collection and preparation of text data from
+any website.  The output is a single JSONL file where each line is a
+self-contained JSON object with a chunk of text and rich metadata.  This
+format is directly usable by:
 
-- OpenAI fine-tuning API
-- Embedding pipelines (text-embedding-ada-002, etc.)
 - RAG (retrieval-augmented generation) vector stores
+- OpenAI / Hugging Face fine-tuning pipelines
+- Embedding APIs (text-embedding-ada-002, sentence-transformers, etc.)
 - Any system that accepts newline-delimited JSON
 
-The pipeline is intentionally simple -- five small Python modules with
-no framework dependencies beyond `requests`, `beautifulsoup4`,
-`html2text`, and `tiktoken`.
+The pipeline uses five focused Python modules and five lightweight
+dependencies.  To scrape a different site, change one line in `config.py`.
 
 ---
 
 ## Architecture
 
 ```
-blog.python.org
-      |
-      v
- +-----------+     +-----------+     +-----------+     +-----------+
- |  SCRAPE   | --> |   CLEAN   | --> |   CHUNK   | --> |  EXPORT   |
- | scraper.py|     | cleaner.py|     | chunker.py|     |exporter.py|
- +-----------+     +-----------+     +-----------+     +-----------+
-      |                                                      |
-      v                                                      v
- output/raw_markdown/                              output/dataset.jsonl
- (debug copies)                                    (final output)
+Any Website
+    |
+    v
++-----------+     +-----------+     +-----------+     +-----------+
+|  SCRAPE   | --> |   CLEAN   | --> |   CHUNK   | --> |  EXPORT   |
+| scraper.py|     | cleaner.py|     | chunker.py|     |exporter.py|
++-----------+     +-----------+     +-----------+     +-----------+
+    |                                                      |
+    v                                                      v
+output/raw_markdown/                              output/dataset.jsonl
+(one .md file per page)                           (final LLM-ready output)
 ```
 
-All stages are orchestrated by `pipeline.py`, which can be run with a
-single command.
+All stages are orchestrated by `pipeline.py`.
 
 ---
 
@@ -64,11 +63,19 @@ single command.
 
 ### Stage 1 -- Scrape (`scraper.py`)
 
-- Uses `requests` with a polite delay between fetches (configurable).
-- Parses listing pages with `BeautifulSoup` to find post links.
-- Follows pagination ("Older Posts") to reach historical content.
-- Converts each post body from HTML to Markdown using `html2text`.
-- Returns a list of dicts: `{title, url, date, markdown}`.
+- Uses BFS (breadth-first search) to crawl all internal pages starting
+  from `BASE_URL`.
+- Respects `SAME_DOMAIN_ONLY` -- will not follow links to external sites.
+- Skips binary files (images, PDFs, CSS, JS, etc.) automatically.
+- Extracts title from OG meta tags, `<h1>`, or `<title>`.
+- Extracts date from `<meta property="article:published_time">`, `<time>`,
+  or common date CSS class patterns.
+- Finds the main content via a priority list of CSS selectors defined in
+  `config.py` -- no hardcoded site-specific logic.
+- Strips noisy elements (nav, footer, sidebar, ads, scripts) before
+  conversion.
+- Converts the content block from HTML to Markdown using `html2text`.
+- Polite delay between requests (configurable).
 
 ### Stage 2 -- Clean (`cleaner.py`)
 
@@ -152,33 +159,93 @@ pip install -r requirements.txt
 python pipeline.py
 ```
 
-### Limit the number of posts
+### Limit the number of pages crawled
 
 ```bash
-python pipeline.py --max-posts 10
+python pipeline.py --max-pages 20
 ```
 
-### Output location
+### Output
 
-After the pipeline completes it prints a summary and the path to the
-JSONL file, which defaults to `output/dataset.jsonl`.
+After the pipeline finishes it prints a summary:
+
+```
+==================================================
+  PIPELINE SUMMARY
+==================================================
+  Records : 87
+  Tokens  : 42,301
+  File    : D:\Web Scraping\output\dataset.jsonl
+  Size    : 183.4 KB
+==================================================
+```
 
 ---
 
-## Configuration
+## Changing the Target Site
 
-All settings live in `config.py`.  Key options:
+### Step 1 -- Set the URL in `config.py`
 
-| Setting          | Default          | Description                               |
-|------------------|------------------|-------------------------------------------|
-| `BASE_URL`       | Python blog URL  | Target site to scrape                     |
-| `MAX_POSTS`      | 50               | Max posts to collect                      |
-| `REQUEST_DELAY`  | 1.5              | Seconds between HTTP requests             |
-| `CHUNK_SIZE`     | 512              | Target tokens per chunk                   |
-| `CHUNK_OVERLAP`  | 64               | Overlapping tokens between chunks         |
-| `ENCODING_NAME`  | cl100k_base      | Tiktoken encoding (GPT-4 compatible)      |
-| `OUTPUT_DIR`     | output           | Directory for output files                |
-| `JSONL_FILENAME` | dataset.jsonl    | Name of the final JSONL file              |
+```python
+BASE_URL = "https://docs.python.org/3/"        # docs site
+BASE_URL = "https://realpython.com/"           # tutorial blog
+BASE_URL = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+```
+
+That is the **only required change** for most sites.
+
+### Step 2 -- Optionally tune content selectors
+
+If the default selectors do not capture the right content, inspect the
+site's HTML (browser DevTools -> right-click -> Inspect) and add your
+selector to the top of `CONTENT_SELECTORS` in `config.py`:
+
+```python
+CONTENT_SELECTORS = [
+    ".my-custom-content",   # add site-specific selector at the top
+    "article",
+    "main",
+    ...
+]
+```
+
+### Step 3 -- Optionally allow cross-domain crawling
+
+```python
+SAME_DOMAIN_ONLY = False  # follow links to any domain
+```
+
+### Common site selectors quick reference
+
+| Site type          | Likely selector             |
+|--------------------|-----------------------------|
+| WordPress blog     | `.entry-content`            |
+| Medium article     | `article`                   |
+| ReadTheDocs        | `.rst-content`              |
+| GitBook docs       | `.page-inner`               |
+| Confluence wiki    | `#main-content`             |
+| Ghost blog         | `.post-content`             |
+
+---
+
+## Configuration Reference
+
+All settings are in `config.py`:
+
+| Setting             | Default           | Description                                     |
+|---------------------|-------------------|-------------------------------------------------|
+| `BASE_URL`          | Python blog URL   | Starting URL for the crawl                      |
+| `MAX_PAGES`         | 50                | Max pages to crawl (None = unlimited)           |
+| `SAME_DOMAIN_ONLY`  | True              | Restrict crawl to the same domain               |
+| `CONTENT_SELECTORS` | (list)            | Priority-ordered CSS selectors for main content |
+| `STRIP_TAGS`        | (list)            | Tags/selectors stripped before conversion       |
+| `REQUEST_DELAY`     | 1.5               | Seconds between requests (be polite)            |
+| `REQUEST_TIMEOUT`   | 30                | HTTP timeout in seconds                         |
+| `CHUNK_SIZE`        | 512               | Target tokens per chunk                         |
+| `CHUNK_OVERLAP`     | 64                | Overlapping tokens between chunks               |
+| `ENCODING_NAME`     | cl100k_base       | Tiktoken encoding (GPT-4 compatible)            |
+| `OUTPUT_DIR`        | output            | Directory for output files                      |
+| `JSONL_FILENAME`    | dataset.jsonl     | Name of the final JSONL file                    |
 
 ---
 
@@ -191,9 +258,9 @@ Each line in `dataset.jsonl` is a JSON object with this schema:
   "id": "a3f8c1e902b7d4e1",
   "text": "Python 3.12 introduces several new features ...",
   "metadata": {
-    "title": "Python 3.12.0 is here",
-    "url": "https://blog.python.org/2024/...",
-    "date": "Monday, October 02, 2024",
+    "title": "What's New In Python 3.12",
+    "url": "https://docs.python.org/3/whatsnew/3.12.html",
+    "date": "2024-10-01T00:00:00",
     "source": "https://blog.python.org/",
     "chunk_index": 0,
     "total_chunks": 3,
@@ -207,10 +274,10 @@ Each line in `dataset.jsonl` is a JSON object with this schema:
 
 - `id` -- Stable hash derived from the URL, chunk index, and content.
 - `text` -- The cleaned Markdown chunk, ready for model consumption.
-- `metadata.title` -- Original blog post title.
-- `metadata.url` -- Permalink to the source post.
-- `metadata.date` -- Publication date as shown on the blog.
-- `metadata.source` -- Root URL of the scraped site.
+- `metadata.title` -- Page title.
+- `metadata.url` -- Source page URL.
+- `metadata.date` -- Publication date detected on the page.
+- `metadata.source` -- The crawl root (BASE_URL).
 - `metadata.chunk_index` -- Zero-based index of this chunk within its post.
 - `metadata.total_chunks` -- How many chunks the parent post was split into.
 - `metadata.token_count` -- Exact token count (cl100k_base encoding).
@@ -220,9 +287,7 @@ Each line in `dataset.jsonl` is a JSON object with this schema:
 
 ## Extending the Pipeline
 
-### Use the data for fine-tuning
-
-Convert JSONL records into the OpenAI fine-tuning format:
+### Use data for RAG / Vector DB
 
 ```python
 import json
@@ -230,20 +295,27 @@ import json
 with open("output/dataset.jsonl") as f:
     for line in f:
         record = json.loads(line)
-        # Build your {"messages": [...]} training example here
-        print(record["text"][:80])
+        text = record["text"]          # embed this
+        metadata = record["metadata"]  # store alongside the vector
 ```
 
-### Use the data for embeddings / RAG
+### Use data for fine-tuning
 
-Feed each record's `text` field into your embedding model and store
-the resulting vector alongside the `metadata` in your vector database.
+Convert to the OpenAI messages format:
 
-### Scrape a different site
+```python
+import json
 
-Change `BASE_URL` in `config.py` and adjust the CSS selectors in
-`scraper.py` (`_parse_post_links`, `_fetch_post_body`) to match the
-new site's HTML structure.
+with open("output/dataset.jsonl") as f:
+    for line in f:
+        record = json.loads(line)
+        training_example = {
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Summarize: " + record["text"][:200]},
+                {"role": "assistant", "content": record["text"]}
+            ]
+        }
 
 ---
 

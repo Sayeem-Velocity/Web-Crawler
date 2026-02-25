@@ -1,14 +1,22 @@
 """
 scraper.py
 ----------
-Fetches blog posts from the Python blog and converts HTML to Markdown.
-Each post is returned as a dict with title, date, url, and markdown body.
+Generic site crawler.  Works with any website by:
+  - Following all internal links (BFS, same domain)
+  - Extracting main content via a priority list of CSS selectors
+  - Converting HTML to Markdown with html2text
+  - Pulling title and date from common meta / structural tags
+
+To use with a different site, change BASE_URL in config.py.
+To tune content extraction, adjust CONTENT_SELECTORS in config.py.
 """
 
 import logging
+import re
 import time
+from collections import deque
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urldefrag
 
 import html2text
 import requests
@@ -25,9 +33,18 @@ _converter.ignore_images = True
 _converter.ignore_emphasis = False
 _converter.body_width = 0  # no wrapping
 
+# Regex: skip non-HTML/text resources
+_SKIP_EXTENSIONS = re.compile(
+    r"\.(png|jpg|jpeg|gif|svg|webp|ico|css|js|pdf|zip|gz|tar|mp4|mp3|woff2?)$",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _get_session() -> requests.Session:
-    """Return a requests session with standard headers."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": config.USER_AGENT,
@@ -38,128 +55,191 @@ def _get_session() -> requests.Session:
 
 
 def _fetch_page(session: requests.Session, url: str) -> Optional[BeautifulSoup]:
-    """Fetch a single page and return a BeautifulSoup object, or None on failure."""
+    """Fetch a URL and return BeautifulSoup, or None on failure."""
     try:
         response = session.get(url, timeout=config.REQUEST_TIMEOUT)
         response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            return None
         return BeautifulSoup(response.text, "lxml")
     except requests.RequestException as exc:
-        logger.error("Failed to fetch %s: %s", url, exc)
+        logger.warning("Skipping %s: %s", url, exc)
         return None
 
 
-def _parse_post_links(soup: BeautifulSoup) -> list[dict]:
-    """Extract post metadata (title, url, date) from a blog listing page."""
-    posts = []
-    for entry in soup.select("div.post"):
-        title_tag = entry.select_one("h3.post-title a") or entry.select_one("h3.post-title")
-        date_tag = entry.select_one("h2.date-header span") or entry.select_one("span.post-timestamp")
+def _normalize_url(url: str, base: str) -> str:
+    """Resolve relative URLs and strip fragment identifiers."""
+    full, _ = urldefrag(urljoin(base, url))
+    return full
 
-        if not title_tag:
+
+def _same_domain(url: str, base_domain: str) -> bool:
+    """Return True if url belongs to the same domain (or a subdomain)."""
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().lstrip("www.")
+    return host == base_domain or host.endswith("." + base_domain)
+
+
+def _collect_links(soup: BeautifulSoup, page_url: str, base_domain: str) -> list[str]:
+    """Return all internal links found on the page."""
+    links = []
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"].strip()
+        if not href or href.startswith("mailto:") or href.startswith("javascript:"):
             continue
-
-        title = title_tag.get_text(strip=True)
-        url = title_tag.get("href", "")
-        date_text = date_tag.get_text(strip=True) if date_tag else "unknown"
-
-        posts.append({
-            "title": title,
-            "url": url,
-            "date": date_text,
-        })
-    return posts
+        full = _normalize_url(href, page_url)
+        if not full.startswith("http"):
+            continue
+        if _SKIP_EXTENSIONS.search(urlparse(full).path):
+            continue
+        if config.SAME_DOMAIN_ONLY and not _same_domain(full, base_domain):
+            continue
+        links.append(full)
+    return links
 
 
-def _get_next_page_url(soup: BeautifulSoup) -> Optional[str]:
-    """Return the URL for the next (older posts) page, or None."""
-    older_link = soup.select_one("a.blog-pager-older-link")
-    if older_link and older_link.get("href"):
-        return older_link["href"]
-    return None
+def _extract_title(soup: BeautifulSoup) -> str:
+    """Extract the page title from common locations."""
+    # Try OG title first (most accurate for blog posts)
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].strip()
+    # Try the first <h1>
+    h1 = soup.find("h1")
+    if h1:
+        return h1.get_text(strip=True)
+    # Fall back to <title> tag
+    if soup.title and soup.title.string:
+        return soup.title.string.strip()
+    return "Untitled"
 
 
-def _fetch_post_body(session: requests.Session, post_url: str) -> str:
-    """Fetch a single post page and return its body as Markdown."""
-    soup = _fetch_page(session, post_url)
-    if soup is None:
-        return ""
+def _extract_date(soup: BeautifulSoup) -> str:
+    """Extract publish date from common meta / structural tags."""
+    # <meta property="article:published_time" ...>
+    meta = soup.find("meta", property="article:published_time")
+    if meta and meta.get("content"):
+        return meta["content"].strip()
+    # <time datetime="...">
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if time_tag:
+        return time_tag["datetime"].strip()
+    # <time> text only
+    time_tag = soup.find("time")
+    if time_tag:
+        return time_tag.get_text(strip=True)
+    # Common CSS class patterns  (e.g. class="date", "published", "post-date", etc.)
+    for cls in ["date", "published", "post-date", "entry-date", "article-date",
+                "post-timestamp", "timestamp", "byline"]:
+        tag = soup.find(class_=re.compile(cls, re.IGNORECASE))
+        if tag:
+            text = tag.get_text(strip=True)
+            if text:
+                return text
+    return "unknown"
 
-    body_div = soup.select_one("div.post-body")
-    if body_div is None:
-        body_div = soup.select_one("div.post")
 
-    if body_div is None:
-        return ""
-
-    html_content = str(body_div)
-    markdown = _converter.handle(html_content)
-    return markdown.strip()
-
-
-def scrape_blog(max_posts: Optional[int] = None) -> list[dict]:
+def _extract_content(soup: BeautifulSoup) -> str:
     """
-    Crawl the Python blog and return a list of post dicts.
+    Extract the main content block as Markdown.
+    Tries CONTENT_SELECTORS in order; falls back to <body>.
+    Strips noisy tags (nav, footer, ads, etc.) before conversion.
+    """
+    # Work on a copy so we don't mutate the original soup
+    working = BeautifulSoup(str(soup), "lxml")
 
-    Each dict contains:
-      - title: str
-      - url: str
-      - date: str
-      - markdown: str  (body converted to Markdown)
+    # Remove noisy elements
+    for selector in config.STRIP_TAGS:
+        for el in working.select(selector):
+            el.decompose()
+
+    # Find the best content container
+    content_el = None
+    for selector in config.CONTENT_SELECTORS:
+        el = working.select_one(selector)
+        if el and len(el.get_text(strip=True)) > 100:
+            content_el = el
+            break
+
+    if content_el is None:
+        content_el = working.find("body") or working
+
+    return _converter.handle(str(content_el)).strip()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def scrape_site(max_pages: Optional[int] = None) -> list[dict]:
+    """
+    Crawl BASE_URL and all reachable internal pages (BFS).
+
+    Returns a list of page dicts, each containing:
+      - title    : str
+      - url      : str
+      - date     : str
+      - markdown : str  (main content converted to Markdown)
 
     Parameters
     ----------
-    max_posts : int or None
-        Stop after collecting this many posts. None means collect all reachable posts.
+    max_pages : int or None
+        Stop after collecting this many pages. Defaults to config.MAX_PAGES.
     """
-    if max_posts is None:
-        max_posts = config.MAX_POSTS or 9999
+    if max_pages is None:
+        max_pages = config.MAX_PAGES or 9999
 
+    base_domain = urlparse(config.BASE_URL).netloc.lower().lstrip("www.")
     session = _get_session()
-    all_posts: list[dict] = []
-    current_url = config.BASE_URL
-    page_num = 0
 
-    logger.info("Starting crawl at %s (max %d posts)", config.BASE_URL, max_posts)
+    visited: set[str] = set()
+    queue: deque[str] = deque([config.BASE_URL])
+    pages: list[dict] = []
 
-    while current_url and len(all_posts) < max_posts:
-        page_num += 1
-        logger.info("Fetching listing page %d: %s", page_num, current_url)
+    logger.info("Crawling %s (domain: %s, max pages: %d)", config.BASE_URL, base_domain, max_pages)
 
-        soup = _fetch_page(session, current_url)
+    while queue and len(pages) < max_pages:
+        url = queue.popleft()
+        url = _normalize_url(url, config.BASE_URL)
+
+        if url in visited:
+            continue
+        visited.add(url)
+
+        logger.info("[%d/%d] Fetching: %s", len(pages) + 1, max_pages, url)
+        soup = _fetch_page(session, url)
         if soup is None:
-            break
+            continue
 
-        page_posts = _parse_post_links(soup)
-        if not page_posts:
-            logger.info("No posts found on page %d, stopping.", page_num)
-            break
+        title = _extract_title(soup)
+        date = _extract_date(soup)
+        markdown = _extract_content(soup)
 
-        for post in page_posts:
-            if len(all_posts) >= max_posts:
-                break
+        if len(markdown) >= 50:
+            pages.append({
+                "title": title,
+                "url": url,
+                "date": date,
+                "markdown": markdown,
+            })
+        else:
+            logger.debug("Skipping %s -- content too short.", url)
 
-            if not post["url"]:
-                # Post body is inline on the listing page; grab it from the entry
-                entry = soup.find("h3", string=post["title"])
-                if entry:
-                    parent = entry.find_parent("div", class_="post")
-                    if parent:
-                        body_div = parent.select_one("div.post-body")
-                        post["markdown"] = _converter.handle(str(body_div)).strip() if body_div else ""
-                    else:
-                        post["markdown"] = ""
-                else:
-                    post["markdown"] = ""
-            else:
-                logger.info("  Fetching post: %s", post["title"])
-                post["markdown"] = _fetch_post_body(session, post["url"])
-                time.sleep(config.REQUEST_DELAY)
+        # Enqueue new links found on this page
+        for link in _collect_links(soup, url, base_domain):
+            if link not in visited:
+                queue.append(link)
 
-            all_posts.append(post)
+        time.sleep(config.REQUEST_DELAY)
 
-        current_url = _get_next_page_url(soup)
-        if current_url:
-            time.sleep(config.REQUEST_DELAY)
+    logger.info("Crawl complete. %d pages collected (%d visited).", len(pages), len(visited))
+    return pages
 
-    logger.info("Crawl complete. Collected %d posts.", len(all_posts))
-    return all_posts
+
+# ---------------------------------------------------------------------------
+# Backward-compatible alias used by pipeline.py
+# ---------------------------------------------------------------------------
+def scrape_blog(max_posts: Optional[int] = None) -> list[dict]:
+    """Alias of scrape_site for backward compatibility."""
+    return scrape_site(max_pages=max_posts)

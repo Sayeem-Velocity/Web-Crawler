@@ -7,7 +7,7 @@ Main entry point.  Runs the full scraping pipeline end-to-end:
 
 Usage:
     python pipeline.py
-    python pipeline.py --max-posts 10
+    python pipeline.py --max-pages 10
 """
 
 import argparse
@@ -113,11 +113,11 @@ def _print_summary(jsonl_path: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Python Blog Scraping Pipeline for LLM")
     parser.add_argument(
-        "--max-posts", type=int, default=None,
-        help="Maximum number of blog posts to scrape (default: value in config.py)"
+        "--max-pages", type=int, default=None,
+        help="Maximum number of pages to scrape (default: value in config.py)"
     )
     args = parser.parse_args()
-    run(max_posts=args.max_posts)
+    run(max_posts=args.max_pages)
 
 
 if __name__ == "__main__":
